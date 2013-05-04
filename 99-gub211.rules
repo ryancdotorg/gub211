@@ -1,0 +1,3 @@
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2101", ATTRS{idProduct}=="0231", MODE:="0666"
+#SUBSYSTEM=="usb", ATTRS{idVendor}=="2101", ATTRS{idProduct}=="0231", OWNER:="ryanc", MODE:="0600"
+#SUBSYSTEM=="usb", ATTRS{idVendor}=="2101", ATTRS{idProduct}=="0231", GROUP:="usb", MODE:="0660"
