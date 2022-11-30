@@ -1,9 +1,10 @@
 /*
 gub211.c
-Copyright (c) 2013 RyanC <code@ryanc.org>
+Copyright © 2013-2022 Ryan Castellucci
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
+
     * Redistributions of source code must retain the above copyright
       notice, this list of conditions and the following disclaimer.
     * Redistributions in binary form must reproduce the above copyright
@@ -36,74 +37,222 @@ set the permissions to allow access to the user you're going to run it as.
 */
 
 #include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+
 #include <libusb-1.0/libusb.h>
 
 #define GUB211_VENDORID  0x2101
 #define GUB211_PRODUCTID 0x0231
+#define MAX_PORT_DEPTH 7
+#define MAX_PATH_STRLEN (5+MAX_PORT_DEPTH*4)
 
 /* compile with gcc -Wall -O2 gub211.c -lusb-1.0 -o gub211 */
 
-int main() {
-#ifdef GUB211_DOLIST
-	libusb_device **devs;
-	ssize_t cnt;
-#endif
-	libusb_context *ctx = NULL;
-	libusb_device_handle *handle;
+int ctrl_transfer(
+libusb_device_handle *handle,
+uint8_t bmRequestType, uint8_t bRequest,
+uint16_t wValue, uint16_t wIndex,
+unsigned char *data, uint16_t wLength,
+unsigned int timeout) {
 	int r;
-	r = libusb_init(&ctx);
-	if (r < 0) {
-		fprintf(stderr, "Error initializing libusb: %d\n", r);
-		return 1;
-	}
-	libusb_set_debug(ctx, 3);
-#ifdef GUB211_DOLIST
-	cnt = libusb_get_device_list(ctx, &devs);
-	if (cnt < 0) {
-		fprintf(stderr, "Error getting device list: %zd\n", cnt);
-		return 1;
-	}
-#endif
-	handle = libusb_open_device_with_vid_pid(ctx, GUB211_VENDORID, GUB211_PRODUCTID);
+	for (int i = 0; i < 2; ++i) {
+		if (libusb_kernel_driver_active(handle, i)) {
+			if ((r = libusb_detach_kernel_driver(handle, i)) != LIBUSB_SUCCESS) {
+				fprintf(stderr, "Detaching kernel driver from interface %d failed: %s\n", i, libusb_error_name(r));
+				return r;
+			}
+		}
 
-#ifdef GUB211_DOLIST
-	libusb_free_device_list(devs, cnt);
-#endif
-	if (libusb_kernel_driver_active(handle, 0) == 1) {
-		if ((r = libusb_detach_kernel_driver(handle, 0)) < 0) {
-			fprintf(stderr, "Detaching kernel driver from interface 0 failed: %d\n", r);
-			return 1;
+		if ((r = libusb_claim_interface(handle, i)) != LIBUSB_SUCCESS) {
+			fprintf(stderr, "Claiming interface %d failed: %s\n", i, libusb_error_name(r));
+			return r;
 		}
 	}
-	if (libusb_kernel_driver_active(handle, 1) == 1) {
-		if ((r = libusb_detach_kernel_driver(handle, 1)) < 0) {
-			fprintf(stderr, "Detaching kernel driver from interface 1 failed: %d\n", r);
-			return 1;
+
+	if ((r = libusb_control_transfer(handle, bmRequestType, bRequest, wValue, wIndex, data, wLength, timeout)) != wLength) {
+		fprintf(stderr, "Control transfer failed: %s\n", libusb_error_name(r));
+		return r >= 0 ? LIBUSB_ERROR_OTHER : r;
+	}
+
+	for (int i = 0; i < 2; ++i) {
+		if ((r = libusb_release_interface(handle, i)) != LIBUSB_SUCCESS) {
+			fprintf(stderr, "Releasing interface %d failed: %s\n", i, libusb_error_name(r));
+			return r;
 		}
 	}
-	if ((r = libusb_claim_interface(handle, 0)) < 0) {
-		fprintf(stderr, "Claiming interface 0 failed: %d\n", r);
+
+	return LIBUSB_SUCCESS;
+}
+
+int switch_to(libusb_device_handle *handle) {
+	return ctrl_transfer(handle, 0x21, 0x09, 0x0203, 0x0001, (unsigned char *)"\x03\x5d\x42\x00\x00", 5, 100);
+}
+
+ssize_t bnprintf(char **d, size_t *n, const char *format, ...) {
+	va_list ap;
+	va_start(ap, format);
+	// length excluding null byte
+	ssize_t len = vsnprintf(*d, *n, format, ap);
+	va_end(ap);
+	if (len < 0 || (size_t)len >= *n) return -1;
+	*n -= len;
+	*d += len;
+	return len;
+}
+
+int path_str(char *str, size_t len, libusb_device *dev) {
+	int r;
+	char *ptr = str;
+	uint8_t bus = libusb_get_bus_number(dev);
+	uint8_t port_numbers[MAX_PORT_DEPTH+1];
+
+	uint8_t n_ports;
+	if ((r = libusb_get_port_numbers(dev, port_numbers, MAX_PORT_DEPTH)) < 0) {
+		fprintf(stderr, "Error getting port numbers: %s\n", libusb_error_name(r));
+		return r;
+	}
+	n_ports = (uint8_t)r;
+
+	if (bnprintf(&ptr, &len, "%u:", bus) < 0) {
+		return LIBUSB_ERROR_OTHER;
+	}
+
+	for (int j = 0; j < n_ports; ++j) {
+		if (bnprintf(&ptr, &len, "%s%u", j ? "/" : "", port_numbers[j]) < 0) {
+			return LIBUSB_ERROR_OTHER;
+		}
+	}
+
+	return LIBUSB_SUCCESS;
+}
+
+int matches_vid_pid(libusb_device *dev, uint16_t vid, uint16_t pid) {
+	int r;
+	struct libusb_device_descriptor desc[1] = {0};
+	if ((r = libusb_get_device_descriptor(dev, desc)) != LIBUSB_SUCCESS) {
+		fprintf(stderr, "Error getting device descriptor: %s\n", libusb_error_name(r));
+		return r;
+	}
+
+	return desc->idVendor == vid && desc->idProduct == pid ? 1 : 0;
+}
+
+int print_list(ssize_t cnt, libusb_device **devs) {
+	int r;
+	char path[MAX_PATH_STRLEN];
+
+	for (ssize_t i = 0; i < cnt; ++i) {
+		if ((r = matches_vid_pid(devs[i], GUB211_VENDORID, GUB211_PRODUCTID)) == 1) {
+			if ((r = path_str(path, MAX_PATH_STRLEN, devs[i])) != LIBUSB_SUCCESS) {
+				fprintf(stderr, "Failed to get path: %d\n", r);
+				return r;
+			}
+			printf("device at: %s\n", path);
+		} else if (r < 0) {
+			return r;
+		}
+	}
+
+	return LIBUSB_SUCCESS;
+}
+
+int main(int argc, char *argv[]) {
+	int r;
+	ssize_t cnt;
+
+	libusb_device **devs = NULL;
+	libusb_context *ctx = NULL;
+	libusb_device_handle *handle = NULL;
+
+	if ((r = libusb_init(&ctx)) != LIBUSB_SUCCESS) {
+		fprintf(stderr, "Error initializing libusb: %s\n", libusb_error_name(r));
 		return 1;
 	}
-	if ((r = libusb_claim_interface(handle, 1)) < 0) {
-		fprintf(stderr, "Claiming interface 1 failed: %d\n", r);
+
+	libusb_set_option(ctx, LIBUSB_OPTION_LOG_LEVEL, 3);
+
+	if ((cnt = libusb_get_device_list(ctx, &devs)) < 0) {
+		fprintf(stderr, "Error getting device list: %s\n", libusb_error_name(cnt));
 		return 1;
 	}
-	/* magic numbers obtained by sniffing the usb bus */
-	if ((r = libusb_control_transfer(handle, 0x21, 0x09, 0x0203, 0x0001, (unsigned char *)"\x03\x5d\x42\x00\x00", 5, 100)) != 5) {
-		fprintf(stderr, "Control transfer failed: %d\n", r);
-		return 1;
+
+	if (argc == 2 && strcmp(argv[1], "list") == 0) {
+		if ((r = print_list(cnt, devs)) != LIBUSB_SUCCESS) {
+			goto cleanup_failure;
+		}
+	} else if (argc == 1 || (argc == 2 && strcmp(argv[1], "first") == 0)) {
+		for (ssize_t i = 0; i < cnt; ++i) {
+			if ((r = matches_vid_pid(devs[i], GUB211_VENDORID, GUB211_PRODUCTID)) == 1) {
+				if ((r = libusb_open(devs[i], &handle)) != LIBUSB_SUCCESS) {
+					fprintf(stderr, "Could not open device: %s\n",  libusb_error_name(r));
+					goto cleanup_failure;
+				}
+				if ((r = switch_to(handle)) != LIBUSB_SUCCESS) { goto cleanup_failure; }
+				goto cleanup_success;
+			} else if (r < 0) {
+				goto cleanup_failure;
+			}
+		}
+		fprintf(stderr, "no devices found\n");
+		goto cleanup_failure;
+	} else if (argc == 2 && strcmp(argv[1], "only") == 0) {
+		ssize_t only = -1;
+		for (ssize_t i = 0; i < cnt; ++i) {
+			if ((r = matches_vid_pid(devs[i], GUB211_VENDORID, GUB211_PRODUCTID)) == 1) {
+				if (only == -1) {
+					only = i;
+				} else {
+					fprintf(stderr, "multiple devices found\n");
+					goto cleanup_failure;
+				}
+			} else if (r < 0) {
+				goto cleanup_failure;
+			}
+		}
+		if (only == -1) {
+			fprintf(stderr, "no devices found\n");
+			goto cleanup_failure;
+		}
+		if ((r = libusb_open(devs[only], &handle)) != LIBUSB_SUCCESS) {
+			fprintf(stderr, "Could not open device: %s\n",  libusb_error_name(r));
+			goto cleanup_failure;
+		}
+		if ((r = switch_to(handle)) != LIBUSB_SUCCESS) { goto cleanup_failure; }
+		goto cleanup_success;
+	} else if (argc == 2) {
+		char path[MAX_PATH_STRLEN];
+		for (ssize_t i = 0; i < cnt; ++i) {
+			if ((r = matches_vid_pid(devs[i], GUB211_VENDORID, GUB211_PRODUCTID)) == 1) {
+				if ((r = path_str(path, MAX_PATH_STRLEN, devs[i])) != LIBUSB_SUCCESS) {
+					fprintf(stderr, "Failed to get path: %d\n", r);
+				} else if (strcmp(path, argv[1]) == 0) {
+					if ((r = libusb_open(devs[i], &handle)) != LIBUSB_SUCCESS) {
+						fprintf(stderr, "Could not open device: %s\n",  libusb_error_name(r));
+						goto cleanup_failure;
+					}
+					if ((r = switch_to(handle)) != LIBUSB_SUCCESS) { goto cleanup_failure; }
+					goto cleanup_success;
+				}
+			} else if (r < 0) {
+				goto cleanup_failure;
+			}
+		}
+		fprintf(stderr, "no matching device\n");
+		goto cleanup_failure;
 	}
-	if ((r = libusb_release_interface(handle, 0)) < 0) {
-		fprintf(stderr, "Releasing interface 0 failed: %d\n", r);
-		return 2;
-	}
-	if ((r = libusb_release_interface(handle, 1)) < 0) {
-		fprintf(stderr, "Releasing interface 1 failed: %d\n", r);
-		return 2;
-	}
-	libusb_close(handle);
+
+cleanup_success:
+	r = EXIT_SUCCESS;
+	goto cleanup_done;
+cleanup_failure:
+	r = EXIT_FAILURE;
+cleanup_done:
+	if (devs != NULL && cnt > 0) { libusb_free_device_list(devs, cnt); }
+	if (handle != NULL) { libusb_close(handle); }
 	libusb_exit(ctx);
-	return 0;
+	return r;
 }
