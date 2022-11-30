@@ -1,4 +1,4 @@
-=== DESCRIPTION ===
+# Description
 
 This is a libusb-1.0 based user space utility to grab the device connected
 to a IOGEAR GUB211 auto sharing usb switch in Linux. The device shows up with
@@ -12,7 +12,7 @@ to use udev rules to set the permissions. The included udev rules allow access
 to all users, but can be modified (examples included) to allow only a specific
 user or group.
 
-=== INSTALL ===
+# Install
 
 Compile with:
 
@@ -21,7 +21,12 @@ Compile with:
 then copy the gub211 binary. Copy the 99-gub211.rules to /etc/udev/rules.d and
 edit if desired.
 
-=== BUGS ===
+# Usage
 
-Currently, only one GUB211 is supported. Using this with more than one
-connected at once will result in undefined behaviour.
+List devices: `gub211 list`
+
+Switch to the first device found: `gub211` or `gub211 first`
+
+Switch to the only device: `gub211 only`
+
+Switch to specific device: `gub211 PATH`
